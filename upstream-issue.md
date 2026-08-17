@@ -8,6 +8,14 @@
 
 ## Nature of the bug
 
+OBI emits an HTTP CLIENT span carrying `http.response.status_code = 499` and span
+status `Error` for a request that succeeded. The peer's own SERVER span for the
+same call reports `200`, and both applications' logs record success. The span
+also reports `http.response.body.size = 0`, and its duration is the socket's
+lifetime rather than the request's. No 499 is ever sent or received on the wire:
+the value is synthesized in `force_finish_http()` when OBI reaches `tcp_close`
+having never observed the response.
+
 Read the span as a story about what happened. Today it says: *"gateway sent a
 POST to router. The router answered 499. The call failed, in 3.6 ms."* Every
 clause is false — nothing sent a 499, the call returned 200 after about a second,
