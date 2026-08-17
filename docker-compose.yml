@@ -1,0 +1,147 @@
+# Reproduction for OBI's phantom 499: an HTTP CLIENT span reported as
+# status_code=499 / STATUS_CODE_ERROR for a request that succeeded with 200.
+#
+#   peer      : the origin. Answers every request 200 and logs one line each.
+#   app       : the process under test. Serves :8080, and for each inbound
+#               request makes one pooled keep-alive HTTP/1.1 call to peer.
+#   loadgen   : inbound requests against app:8080.
+#   obi-app   : the instrumentation under test, watching app. Its CLIENT spans
+#               are where the defect appears.
+#   obi-peer  : a second instance watching peer. Its SERVER spans are the
+#               independent record of what the peer actually answered.
+#   collector : OTLP sink writing every span to ./out/traces.jsonl.
+#
+# Run one scenario:  ./run.sh K1
+# Run all of them:   ./run.sh all
+
+services:
+  peer:
+    build: ./peer
+    container_name: obi-499-peer
+    environment:
+      PEER_PORT: "9000"
+      BODY_BYTES: "${BODY_BYTES:-64}"
+      RESP_CHUNKS: "${RESP_CHUNKS:-1}"
+      PEER_MODE: "${PEER_MODE:-http}"
+      SPLIT_AT: "${SPLIT_AT:-0}"
+      SPLIT_DELAY_MS: "${SPLIT_DELAY_MS:-2}"
+      PEER_KEEPALIVE_TIMEOUT_MS: "${PEER_KEEPALIVE_TIMEOUT_MS:-5000}"
+    expose:
+      - "9000"
+
+  relay:
+    build: ./relay
+    container_name: obi-499-relay
+    environment:
+      RELAY_PORT: "9100"
+      PEER_HOST: "peer"
+      PEER_PORT: "9000"
+      RESEG_AT: "${RESEG_AT:-0}"
+      RESEG_DELAY_MS: "${RESEG_DELAY_MS:-2}"
+    expose:
+      - "9100"
+    depends_on:
+      - peer
+
+  app:
+    build: ./app
+    container_name: obi-499-app
+    environment:
+      LISTEN_PORT: "8080"
+      PEER_HOST: "${APP_PEER_HOST:-relay}"
+      PEER_PORT: "${APP_PEER_PORT:-9100}"
+      KEEPALIVE: "${KEEPALIVE:-true}"
+      MAX_SOCKETS: "${MAX_SOCKETS:-8}"
+      KEEPALIVE_MSECS: "${KEEPALIVE_MSECS:-30000}"
+      REAP_MS: "${REAP_MS:-0}"
+    expose:
+      - "8080"
+    depends_on:
+      - peer
+      - relay
+
+  loadgen:
+    build: ./loadgen
+    container_name: obi-499-loadgen
+    environment:
+      APP_HOST: "app"
+      APP_PORT: "8080"
+      CONCURRENCY: "${CONCURRENCY:-4}"
+      DURATION_S: "${DURATION_S:-60}"
+      START_DELAY_S: "${START_DELAY_S:-12}"
+      THINK_MS: "${THINK_MS:-0}"
+    depends_on:
+      - app
+
+  collector:
+    image: otel/opentelemetry-collector-contrib:0.140.0
+    container_name: obi-499-collector
+    command: ["--config=/etc/otelcol/config.yaml"]
+    # The image's default user cannot write to a bind mount owned by the host
+    # user, and the file exporter fails to start rather than degrading.
+    user: "0:0"
+    volumes:
+      - ./collector/config.yaml:/etc/otelcol/config.yaml:ro
+      - ./out:/out
+    expose:
+      - "4317"
+      - "4318"
+
+  obi-app:
+    image: "${OBI_IMAGE:-otel/ebpf-instrument:main}"
+    container_name: obi-499-obi-app
+    privileged: true
+    pid: "service:app"
+    network_mode: "service:app"
+    environment:
+      OTEL_EBPF_OPEN_PORT: "8080"
+      OTEL_EBPF_SERVICE_NAME: "app"
+      OTEL_EBPF_LOG_LEVEL: "${OBI_LOG_LEVEL:-info}"
+      OTEL_EBPF_BPF_DEBUG: "${OBI_BPF_DEBUG:-false}"
+      OTEL_EBPF_TRACES_SAMPLER_NAME: "always_on"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://collector:4318"
+      OTEL_EXPORTER_OTLP_PROTOCOL: "http/protobuf"
+      OTEL_EXPORTER_OTLP_TRACES_PROTOCOL: "http/protobuf"
+      OTEL_EBPF_METRICS_FEATURES: ""
+      BEYLA_OPEN_PORT: "8080"
+      BEYLA_SERVICE_NAME: "app"
+      BEYLA_LOG_LEVEL: "${OBI_LOG_LEVEL:-info}"
+      BEYLA_BPF_DEBUG: "${OBI_BPF_DEBUG:-false}"
+      BEYLA_TRACES_SAMPLER_NAME: "always_on"
+      BEYLA_OTEL_TRACES_EXPORTER: "otlp"
+    volumes:
+      - /sys/kernel/security:/sys/kernel/security
+      - /sys/kernel/debug:/sys/kernel/debug
+      - /sys/fs/cgroup:/sys/fs/cgroup
+    depends_on:
+      - app
+      - collector
+
+  obi-peer:
+    image: "${OBI_IMAGE:-otel/ebpf-instrument:main}"
+    container_name: obi-499-obi-peer
+    privileged: true
+    pid: "service:peer"
+    network_mode: "service:peer"
+    environment:
+      OTEL_EBPF_OPEN_PORT: "9000"
+      OTEL_EBPF_SERVICE_NAME: "peer"
+      OTEL_EBPF_LOG_LEVEL: "${OBI_LOG_LEVEL:-info}"
+      OTEL_EBPF_BPF_DEBUG: "false"
+      OTEL_EBPF_TRACES_SAMPLER_NAME: "always_on"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://collector:4318"
+      OTEL_EXPORTER_OTLP_PROTOCOL: "http/protobuf"
+      OTEL_EXPORTER_OTLP_TRACES_PROTOCOL: "http/protobuf"
+      OTEL_EBPF_METRICS_FEATURES: ""
+      BEYLA_OPEN_PORT: "9000"
+      BEYLA_SERVICE_NAME: "peer"
+      BEYLA_LOG_LEVEL: "${OBI_LOG_LEVEL:-info}"
+      BEYLA_TRACES_SAMPLER_NAME: "always_on"
+      BEYLA_OTEL_TRACES_EXPORTER: "otlp"
+    volumes:
+      - /sys/kernel/security:/sys/kernel/security
+      - /sys/kernel/debug:/sys/kernel/debug
+      - /sys/fs/cgroup:/sys/fs/cgroup
+    depends_on:
+      - peer
+      - collector

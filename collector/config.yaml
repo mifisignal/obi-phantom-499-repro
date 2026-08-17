@@ -1,0 +1,26 @@
+# Minimal OTLP sink. Its only job is to write every span OBI exports to a file
+# so check.py can assert over it. No sampling, no batching delay worth caring
+# about, no processors that could alter what OBI emitted.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+exporters:
+  file:
+    path: /out/traces.jsonl
+    flush_interval: 1s
+  debug:
+    verbosity: basic
+
+service:
+  telemetry:
+    logs:
+      level: warn
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [file, debug]
