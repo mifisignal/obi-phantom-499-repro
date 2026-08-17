@@ -6,6 +6,40 @@
 `bpf/generictracer/k_tracer.c` — `obi_kprobe_tcp_close`, `tcp_cleanup_rbuf`
 `bpf/generictracer/k_send_receive.h` — `force_sent_event()`, `should_ignore_unreadable()`
 
+## Nature of the bug
+
+Read the span as a story about what happened. Today it says: *"gateway sent a
+POST to router. The router answered 499. The call failed, in 3.6 ms."* Every
+clause is false — nothing sent a 499, the call returned 200 after about a second,
+and 3.6 ms is when OBI stopped watching rather than when the request ended. The
+dangerous property is that the story is complete and coherent: no gap, no null,
+nothing that looks wrong, so a reader acts on it and chases a failure that never
+happened, or concludes the callee is flaky. A fabricated status is an unknown
+unknown; a missing span is at least a known one.
+
+What it should say: *"this process sent an HTTP request at T. I observed the
+request. I never observed the outcome, because the connection went away. Duration
+was at least X; the true duration and result are unknown."* That is three useful
+facts rather than an absence — the call happened, so the service-graph edge is
+real; the duration is a lower bound rather than a measurement; and the outcome is
+unknown, which is distinct from both success and failure.
+
+The distinction the current design cannot express is **absence of evidence versus
+evidence of failure**. Instrumentation is an observer, and observers lose track —
+an unreadable buffer, a socket torn down mid-flight. A model offering only
+"worked" or "failed" forces the observer to lie when it does not know. OTel
+already has the right container: span status is `Unset` / `Ok` / `Error`, and
+`Unset` means no explicit judgment was made. "Unknown" is expressible in the
+spec. OBI cannot reach it only because `status == 0` is already taken internally
+by "still reading" — the overloaded field described below.
+
+Given such a span, a consumer should be able to render it in the trace without
+colouring it as an error; exclude it from error rates without silently counting
+it as a success, which is the quieter lie; leave error-based tail-sampling
+policies untriggered, where ours currently force-keeps every trace containing
+one; and draw the service-graph edge without marking it failed. None of that is
+possible while the span asserts a status code.
+
 ## The invariant
 
 A CLIENT span carrying `http.response.status_code = 499` describes a state that
@@ -46,11 +80,10 @@ response and logs success. OBI emits a CLIENT span with
 `http.response.body.size = 0`. A second OBI instance watching the peer emits a
 SERVER span reporting 200 for the same call.
 
-The duration is wrong too. The span runs from the request write to
-`bpf_ktime_get_ns()` at `tcp_close`, so it measures the socket's lifetime rather
-than the request's — a median of 64.9 ms against a median actual call of 3.1 ms
-in one scenario, and 6 full seconds when the connection sits in a pool that is
-never reaped.
+The duration measures the socket's lifetime rather than the request's, running
+from the request write to `bpf_ktime_get_ns()` at `tcp_close`: a median of
+64.9 ms against a median actual call of 3.1 ms in one scenario, and 6 full
+seconds when the connection sits in a pool that is never reaped.
 
 ## This was never specified
 
