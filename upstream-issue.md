@@ -159,8 +159,8 @@ Read that way the intent was almost certainly not to report a client abort. It
 was to avoid losing the span, and 499 is the least-wrong non-zero value when the
 meaning is "the connection went away before I saw a response" — `0` means
 in-flight, and any 5xx would falsely blame the server. `high_request_volume`
-gating the whole branch fits the same reading: under load the fabrication is
-skipped and the span is dropped instead. That is a deliberate trade between
+gating the whole branch fits the same reading: with that option set the
+fabrication is skipped and the span is dropped instead. That is a deliberate trade between
 losing a record and inventing a status, made inside a struct that offered only
 those two options.
 
