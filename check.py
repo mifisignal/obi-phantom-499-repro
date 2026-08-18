@@ -2,11 +2,25 @@
 """Assert that OBI never reports a successful HTTP call as a 499 error.
 
 Reads one scenario's artifacts -- the collector's OTLP-JSON file sink plus the
-two applications' access logs -- and applies a single assertion:
+two applications' access logs -- and applies two assertions:
 
-    no CLIENT span emitted for the app may carry http.response.status_code=499
-    or status=STATUS_CODE_ERROR, given that the peer answered every request 200
-    and neither application recorded an abort.
+    1. No CLIENT span emitted for the app may carry
+       http.response.status_code=499 or status=STATUS_CODE_ERROR, given that the
+       peer answered every request 200 and neither application recorded an abort.
+
+    2. The requests those spans described must still be represented. A request
+       OBI force-finished without seeing the response has to appear either as a
+       499 (the defect) or as a span reporting no status at all (a fix). If both
+       counts collapse, the spans have simply vanished.
+
+The second assertion exists because the cheapest way to make the first one pass
+is to delete the line that sets 499, and doing that drops the record instead:
+finish_http() only emits when status != 0, so a request with no observed
+response silently disappears. That is the regression OBI PR #767 introduced
+force_finish_http() to fix, and it is invisible to any assertion that only looks
+at the spans that were emitted. baselines.json records how many of these records
+each scenario produces, measured against unpatched OBI, so "they vanished" is
+distinguishable from "this scenario never generated any".
 
 This is a regression test, so the exit code is inverted relative to a
 demonstration script: exit 1 means the defect is present, exit 0 means the run
@@ -107,6 +121,43 @@ def is_error(sp):
     return sp.get("status", {}).get("code") == 2
 
 
+def reports_no_status(sp):
+    """A span that does not claim an HTTP status.
+
+    Semconv requires http.response.status_code "if and only if one was
+    received/sent", so this is what a request whose response was never observed
+    should look like. Deliberately keyed on the absence of the semconv
+    attribute rather than on any marker a particular fix might add, so this
+    stays a test of the observable contract.
+    """
+    return sp["_attrs"].get("http.response.status_code") is None
+
+
+# How many force-finished records each scenario produces, as a share of the
+# calls the app made, measured against unpatched OBI. These are the requests
+# whose response OBI never observed and which it then force-finished at
+# tcp_close -- exactly the population that carried the phantom 499.
+#
+# Measured on otel/ebpf-instrument built from 4a6614e (2026-08-17), c7g.2xlarge
+# / Ubuntu 24.04 / kernel 7.0.0-1010-aws, DURATION_S=40 CONCURRENCY=2:
+#
+#   C0      0 of 10826 calls    0.0000   control: OBI observes every response
+#   S1   8505 of  8506 calls    0.9999   connection per request
+#   S2    216 of  9426 calls    0.0229   keep-alive, 250ms idle reaping
+#   S3      2 of  9495 calls    0.0002   keep-alive, never reaped
+BASELINE_FORCE_FINISHED_PER_CALL = {
+    "C0": 0.0,
+    "S1": 0.9999,
+    "S2": 0.0229,
+    "S3": 0.0002,
+}
+
+# The counts above are rates over a timed run, not fixed quantities, so they
+# move between runs with load and scheduling. Half the baseline is far below
+# that variation and far above the zero a dropped-span regression produces.
+BASELINE_TOLERANCE = 0.5
+
+
 def describe(sp):
     a = sp["_attrs"]
     return (
@@ -180,12 +231,20 @@ def main():
         print("\nFAIL  control: a peer SERVER span reports a status other than 200.")
         return 1
 
-    # ---- The assertion.
+    # ---- The assertions.
     phantom = [
         s
         for s in app_client
         if s["_attrs"].get("http.response.status_code") == 499 or is_error(s)
     ]
+    no_status = [s for s in app_client if reports_no_status(s)]
+
+    # A force-finished request is represented either way: as a 499 before a fix,
+    # or as a span reporting no status after one. Counting both is what makes
+    # this independent of which of the two OBI is doing.
+    represented = len({id(s) for s in phantom} | {id(s) for s in no_status})
+    expected = BASELINE_FORCE_FINISHED_PER_CALL[scenario] * len(app_calls)
+    floor = expected * BASELINE_TOLERANCE
 
     print()
     print(f"  CLIENT spans reporting 499 or STATUS_CODE_ERROR   {len(phantom)}")
@@ -246,6 +305,36 @@ def main():
     if missing > 0:
         print(f"\n  note: {missing} of {len(app_calls)} outbound calls produced no CLIENT span at all.")
 
+    # ---- Assertion 2: the force-finished requests are still represented.
+    print()
+    print(f"  CLIENT spans reporting no HTTP status                {len(no_status)}")
+    print(f"  force-finished requests represented, either way      {represented}")
+    print(f"  expected from the baseline for this scenario         {expected:.0f} "
+          f"(floor {floor:.0f})")
+
+    if no_status:
+        bad_status = [s for s in no_status if is_error(s)]
+        print(f"  of those, spans marked STATUS_CODE_ERROR             {len(bad_status)}")
+        if bad_status:
+            print()
+            print("FAIL  a CLIENT span reports no HTTP status and is still marked an error.")
+            print("      With no response observed there is nothing to judge, so the span")
+            print("      status belongs at unset. Reporting an error here asserts a failure")
+            print("      that was never seen -- the same false error the 499 produced, moved")
+            print("      from the status code to the span status.")
+            return 1
+
+    if represented < floor:
+        print()
+        print(f"FAIL  THE SPANS VANISHED: this scenario force-finishes about {expected:.0f} requests,")
+        print(f"      and only {represented} are represented in the trace at all -- neither as a 499")
+        print( "      nor as a span reporting no status. Removing the fabricated 499 without")
+        print( "      changing how finish_http() decides what to emit does exactly this: the")
+        print( "      status != 0 gate drops the record, and the call disappears. That is the")
+        print( "      regression PR #767 added force_finish_http() to fix. A fix has to make")
+        print( "      'the response was never observed' representable, not unreportable.")
+        return 1
+
     if phantom:
         print()
         print(f"FAIL  DEFECT PRESENT: {len(phantom)} CLIENT span(s) report the call as a 499")
@@ -258,8 +347,9 @@ def main():
         return 1
 
     print()
-    print("PASS  no CLIENT span reports 499 or an error status. Every call the app")
-    print("      made is either represented faithfully or not at all.")
+    print("PASS  no CLIENT span reports 499 or an error status, and the requests whose")
+    print(f"      response OBI never observed are still in the trace ({len(no_status)} of them,")
+    print("      reporting no status and left unset rather than dropped).")
     return 0
 
 

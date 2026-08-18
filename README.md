@@ -44,6 +44,16 @@ assertions and runs against any previous scenario directory.
 `check.py` **exits 1 when the defect is present**. It is written as a regression
 test, so a future fix turns every scenario green with no edit here.
 
+It asserts two things, and a fix has to satisfy both. First, no CLIENT span may
+report 499 or an error status. Second, the requests those spans described must
+still be represented — as a span reporting no HTTP status, if not as a 499. The
+second assertion exists because the cheapest way to pass the first one is to
+delete the line that fabricates the 499, and that drops the span instead:
+`finish_http()` only emits when `status != 0`. The per-scenario baselines in
+`check.py`'s `BASELINE_FORCE_FINISHED_PER_CALL`, measured against unpatched OBI,
+are what let it tell "the spans vanished" apart from "this scenario produced
+none".
+
 ## Scenarios
 
 | | Response segmentation | App's outbound pool | Phantom 499s | `check.py` |
